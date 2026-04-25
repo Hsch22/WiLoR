@@ -1,9 +1,10 @@
 # WiLoR HoloAssist Video Data Flow
 
-This pipeline runs WiLoR on already-extracted HoloAssist videos and writes a
-per-video overlay plus structured per-detection outputs. It is intentionally
-not a Dyn-HaMR or HaMeR replica: it does not do ego-hand filtering, tracking,
-smoothing, root optimization, or multi-view rendering.
+This pipeline runs WiLoR on already-extracted HoloAssist videos and writes
+WiLoR-fitted hand mesh, skeleton, and camera-coordinate QA videos plus
+structured per-detection outputs. It is intentionally not a Dyn-HaMR or HaMeR
+replica: it does not do ego-hand filtering, tracking, smoothing, root
+optimization, identity locking, or multi-view rendering.
 
 ## Inputs
 
@@ -23,15 +24,9 @@ Each processable video directory must contain:
 <video_name>/Export_py/Hands/Right_sync.txt
 ```
 
-The annotation file is read from:
-
-```text
-data-annotation-trainval-v1_1.json
-```
-
-When `--video_name` is omitted, batch selection follows annotation order and
-skips missing inputs. Explicit `--video_name` requests fail on missing files
-unless `--skip_missing` is set.
+`Pose_sync.txt`, `Intrinsics.txt`, and HoloAssist hands are required for input
+completeness and optional QA export only. WiLoR detections are not filtered by
+HoloAssist hands.
 
 ## Commands
 
@@ -63,6 +58,14 @@ Run WiLoR on one sample:
   --export_hands
 ```
 
+Rebuild public videos from existing results without detector/model inference:
+
+```bash
+./.venv/bin/python scripts/holoassist_wilor_video_batch.py render-overlays \
+  --sample_dir /share/project/RoboBrain-World-dataset/HoloAssist-wilor-video/R035-12July-Nespresso \
+  --overwrite
+```
+
 Useful options:
 
 ```text
@@ -72,7 +75,7 @@ Useful options:
 --limit             Limit selected processable videos
 --start_frame       Debug clip start frame
 --max_frames        Debug clip frame count
---overwrite         Remove and rebuild this sample output
+--overwrite         Remove and rebuild this sample output or public videos
 --skip_missing      Skip explicit missing video names
 --copy_video        Copy source MP4 instead of symlinking
 --export_hands      Export resampled HoloAssist hands QA
@@ -123,9 +126,35 @@ Per sample:
     summary.json
   manifest.json
   run_wilor_video.sh
-  handpose_skeleton_overlay.mp4
+  handmesh_overlay.mp4
+  hand_skeleton_overlay.mp4
+  handmesh_fitted_camera_coords_overlay.mp4
+  hand_skeleton_fitted_camera_coords_overlay.mp4
   holoassist_hands_qa.npz        # only with --export_hands
 ```
+
+Four public videos are recorded in `manifest.output_videos`:
+
+| Key | File | Content |
+| --- | --- | --- |
+| `handmesh_overlay` | `handmesh_overlay.mp4` | WiLoR fitted mesh only |
+| `hand_skeleton_overlay` | `hand_skeleton_overlay.mp4` | WiLoR fitted 21-joint skeleton only |
+| `handmesh_fitted_camera_coords_overlay` | `handmesh_fitted_camera_coords_overlay.mp4` | mesh + fitted skeleton + fitted camera-coordinate labels |
+| `hand_skeleton_fitted_camera_coords_overlay` | `hand_skeleton_fitted_camera_coords_overlay.mp4` | fitted skeleton + fitted camera-coordinate labels |
+
+`outputs.overlay_video` is kept only as a compatibility field and points to
+`hand_skeleton_overlay.mp4`. The old `handpose_skeleton_overlay.mp4` is not a
+main output.
+
+WiLoR does not generate Dyn-HaMR-style observed videos. `manifest` records
+`omitted_output_videos` for:
+
+```text
+handmesh_observed_camera_coords_overlay
+hand_skeleton_observed_camera_coords_overlay
+```
+
+## Detection Arrays
 
 `detections.npz` contains:
 
@@ -137,13 +166,25 @@ score[D] float32
 is_right[D] int8                # 0=left, 1=right
 cam_t[D,3] float32
 joints_3d[D,21,3] float16
+joints_cam[D,21,3] float32      # WiLoR fitted camera coords: joints_3d + cam_t
 joints_2d[D,21,2] float32
 vertices[D,778,3] float16
+focal_length[D] float32
 frame_count int32
 fps float32
 width int32
 height int32
 ```
+
+The camera-coordinate labels use WiLoR fitted camera coordinates:
+
+```text
+joints_cam = joints_3d + cam_t
+```
+
+These coordinates match the WiLoR mesh rendering and full-image 2D projection
+used by this pipeline. They are not HoloAssist world coordinates, device-camera
+coordinates, or HoloAssist hand matrices.
 
 `frames.jsonl` has one line per processed frame:
 
@@ -152,41 +193,89 @@ height int32
 ```
 
 `holoassist_hands_qa.npz` stores nearest-neighbor resampled HoloAssist left and
-right hand sidecars for the processed frame times. It is for QA only and is not
-used to filter WiLoR detections.
+right hand sidecars for the processed frame times. It is for QA only.
 
 ## Frame Processing
 
-For each decoded frame:
+For each decoded frame in `infer-one`:
 
-1. Run the WiLoR YOLO detector and keep every hand detection.
+1. Run the WiLoR YOLO detector and keep every valid hand detection.
 2. Build WiLoR crops with `ViTDetDataset`.
 3. Batch all detected hands through WiLoR.
 4. Restore left/right hand orientation, compute full-image camera translation,
-   and project the 21 predicted joints to image coordinates.
-5. Render all meshes with `Renderer.render_rgba_multiple`.
-6. Draw bbox, left/right label, confidence, and 21-joint skeleton.
-7. Write one overlay video frame and one `frames.jsonl` record.
+   project the 21 predicted joints to image coordinates, and compute
+   `joints_cam`.
+5. Render the mesh once with `Renderer.render_rgba_multiple`.
+6. Write four public videos. Frames without detections write the original
+   frame to all four videos.
+7. Write one `frames.jsonl` record.
 
-Frames with no detections are still written to the overlay video and recorded
-with `num_detections=0`.
+If mesh rendering fails for a frame, mesh videos fall back to the original frame
+and `render_failures` is incremented. Skeleton videos are still written from the
+WiLoR fitted 2D joints. Coordinate labels are drawn only when both the 2D point
+and `joints_cam` are finite and `z > 0`.
 
-## Verified Locally
+## Completed Sample Migration
 
-On this machine:
+For already completed full samples, run postprocess rendering only:
 
-```text
-annotations: 1758
-video_dirs: 2221
-processable_dirs: 2111
+```bash
+for sample in R007-7July-DSLR R029-12July-DSLR R035-12July-Nespresso; do
+  ./.venv/bin/python scripts/holoassist_wilor_video_batch.py render-overlays \
+    --sample_dir "/share/project/RoboBrain-World-dataset/HoloAssist-wilor-video/${sample}" \
+    --overwrite
+done
 ```
 
-Smoke checks:
+This reads existing `detections.npz`, `frames.jsonl`, and workspace video. It
+does not run the detector or WiLoR model inference. Old `detections.npz` files
+are extended with `joints_cam` and `focal_length` when those fields are absent.
 
-```text
-R035-12July-Nespresso, frames=30, detections=0
-R007-7July-DSLR, frames=5, detections=10
+## Verification
+
+Static check:
+
+```bash
+./.venv/bin/python -m py_compile \
+  scripts/holoassist_wilor_video_batch.py \
+  scripts/wilor_video_pipeline_common.py
 ```
 
-Both runs produced readable overlay MP4 files, loadable `detections.npz`, and
-`frames.jsonl` line counts matching the processed frame count.
+Video and manifest check:
+
+```bash
+./.venv/bin/python - <<'PY'
+import cv2, json, numpy as np
+from pathlib import Path
+
+root = Path("/share/project/RoboBrain-World-dataset/HoloAssist-wilor-video/R035-12July-Nespresso")
+manifest = json.loads((root / "manifest.json").read_text())
+assert manifest["status"] == "complete"
+assert set(manifest["output_videos"]) == {
+    "handmesh_overlay",
+    "hand_skeleton_overlay",
+    "handmesh_fitted_camera_coords_overlay",
+    "hand_skeleton_fitted_camera_coords_overlay",
+}
+assert not any("observed" in key for key in manifest["output_videos"])
+
+for item in manifest["output_videos"].values():
+    p = Path(item["path"])
+    cap = cv2.VideoCapture(str(p))
+    print(p.name, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), cap.get(cv2.CAP_PROP_FPS),
+          int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+    cap.release()
+
+data = np.load(root / "wilor_results" / "detections.npz")
+assert {"joints_3d", "joints_cam", "joints_2d", "cam_t", "vertices", "focal_length"} <= set(data.files)
+PY
+```
+
+## Constraints
+
+- Full videos are much slower than smoke clips because mesh rendering is per
+  frame with detections.
+- Current output is fitted-only. HoloAssist hands remain QA sidecars and are
+  not observed labels.
+- The pipeline does not lock identity to the recording wearer’s hands; all
+  WiLoR hand detections are exported.

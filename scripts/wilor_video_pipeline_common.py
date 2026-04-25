@@ -36,6 +36,40 @@ REQUIRED_RELATIVE_FILES = (
     "Export_py/Hands/Right_sync.txt",
 )
 
+WILOR_PUBLIC_VIDEO_OUTPUTS = {
+    "handmesh_overlay": {
+        "filename": "handmesh_overlay.mp4",
+        "source": "wilor_fitted_mesh",
+        "coord_source": None,
+    },
+    "hand_skeleton_overlay": {
+        "filename": "hand_skeleton_overlay.mp4",
+        "source": "wilor_fitted_skeleton",
+        "coord_source": None,
+    },
+    "handmesh_fitted_camera_coords_overlay": {
+        "filename": "handmesh_fitted_camera_coords_overlay.mp4",
+        "source": "wilor_fitted_mesh",
+        "coord_source": "detections.npz:joints_cam",
+    },
+    "hand_skeleton_fitted_camera_coords_overlay": {
+        "filename": "hand_skeleton_fitted_camera_coords_overlay.mp4",
+        "source": "wilor_fitted_skeleton",
+        "coord_source": "detections.npz:joints_cam",
+    },
+}
+
+WILOR_OMITTED_PUBLIC_VIDEO_OUTPUTS = {
+    "handmesh_observed_camera_coords_overlay": {
+        "filename": "handmesh_observed_camera_coords_overlay.mp4",
+        "reason": "WiLoR HoloAssist pipeline currently exports fitted WiLoR results only; HoloAssist hands are QA sidecars, not observed labels.",
+    },
+    "hand_skeleton_observed_camera_coords_overlay": {
+        "filename": "hand_skeleton_observed_camera_coords_overlay.mp4",
+        "reason": "WiLoR HoloAssist pipeline currently exports fitted WiLoR results only; HoloAssist hands are QA sidecars, not observed labels.",
+    },
+}
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -246,7 +280,7 @@ def prepare_workspace_video(
 
 def sample_output_paths(output_root: Path, seq_name: str) -> Dict[str, Path]:
     sample_dir = output_root / seq_name
-    return {
+    paths = {
         "sample_dir": sample_dir,
         "workspace_dir": sample_dir / "wilor_workspace",
         "workspace_video": sample_dir / "wilor_workspace" / "videos" / f"{seq_name}.mp4",
@@ -256,8 +290,41 @@ def sample_output_paths(output_root: Path, seq_name: str) -> Dict[str, Path]:
         "summary_json": sample_dir / "wilor_results" / "summary.json",
         "manifest_json": sample_dir / "manifest.json",
         "run_script": sample_dir / "run_wilor_video.sh",
-        "overlay_video": sample_dir / "handpose_skeleton_overlay.mp4",
+        "legacy_overlay_video": sample_dir / "handpose_skeleton_overlay.mp4",
         "hands_qa_npz": sample_dir / "holoassist_hands_qa.npz",
+    }
+    for key, spec in WILOR_PUBLIC_VIDEO_OUTPUTS.items():
+        paths[f"{key}_video"] = sample_dir / spec["filename"]
+    paths["overlay_video"] = paths["hand_skeleton_overlay_video"]
+    return paths
+
+
+def wilor_public_video_paths(sample_dir: Path) -> Dict[str, Path]:
+    return {
+        key: sample_dir / spec["filename"]
+        for key, spec in WILOR_PUBLIC_VIDEO_OUTPUTS.items()
+    }
+
+
+def wilor_output_videos_manifest(sample_dir: Path) -> Dict[str, Dict[str, Any]]:
+    paths = wilor_public_video_paths(sample_dir)
+    return {
+        key: {
+            "path": str(paths[key]),
+            "source": spec["source"],
+            "coord_source": spec["coord_source"],
+        }
+        for key, spec in WILOR_PUBLIC_VIDEO_OUTPUTS.items()
+    }
+
+
+def wilor_omitted_output_videos_manifest() -> Dict[str, Dict[str, str]]:
+    return {
+        key: {
+            "filename": spec["filename"],
+            "reason": spec["reason"],
+        }
+        for key, spec in WILOR_OMITTED_PUBLIC_VIDEO_OUTPUTS.items()
     }
 
 

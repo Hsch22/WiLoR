@@ -6,11 +6,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pickle
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import wilor_video_pipeline_common as common
 
@@ -127,6 +128,14 @@ def build_parser() -> argparse.ArgumentParser:
     infer_parser.add_argument("--fast", action="store_true")
     infer_parser.add_argument("--overwrite", action="store_true")
     infer_parser.set_defaults(func=cmd_infer_one)
+
+    render_parser = subparsers.add_parser(
+        "render-overlays",
+        help="Rebuild WiLoR public overlay videos from existing detections.",
+    )
+    render_parser.add_argument("--sample_dir", type=Path, required=True)
+    render_parser.add_argument("--overwrite", action="store_true")
+    render_parser.set_defaults(func=cmd_render_overlays)
     return parser
 
 
@@ -285,7 +294,12 @@ def build_manifest_for_sample(
             "manifest_json",
             "run_script",
             "overlay_video",
+            "legacy_overlay_video",
             "hands_qa_npz",
+            "handmesh_overlay_video",
+            "hand_skeleton_overlay_video",
+            "handmesh_fitted_camera_coords_overlay_video",
+            "hand_skeleton_fitted_camera_coords_overlay_video",
         }
     }
     manifest: Dict[str, Any] = {
@@ -325,6 +339,8 @@ def build_manifest_for_sample(
             "fast": bool(fast),
         },
         "outputs": output_paths,
+        "output_videos": common.wilor_output_videos_manifest(paths["sample_dir"]),
+        "omitted_output_videos": common.wilor_omitted_output_videos_manifest(),
     }
     common.write_json(paths["manifest_json"], manifest)
     common.write_run_script(
@@ -449,6 +465,11 @@ def cmd_infer_one(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_render_overlays(args: argparse.Namespace) -> int:
+    render_overlays_from_results(sample_dir=args.sample_dir, overwrite=args.overwrite)
+    return 0
+
+
 def project_points_full_img(points, cam_trans, focal_length: float, img_res):
     import numpy as np
 
@@ -555,6 +576,7 @@ def infer_frame_hands(
             cam_t = pred_cam_t_full[n]
             img_res = img_size[n].detach().cpu().numpy().astype("float32")
             joints_2d = project_points_full_img(joints, cam_t, focal_length, img_res)
+            joints_cam = joints.astype("float32") + cam_t.astype("float32").reshape(1, 3)
             hands.append(
                 {
                     "det_id": det_id,
@@ -563,6 +585,7 @@ def infer_frame_hands(
                     "is_right": is_right,
                     "cam_t": cam_t,
                     "joints_3d": joints,
+                    "joints_cam": joints_cam,
                     "joints_2d": joints_2d,
                     "vertices": verts,
                     "focal_length": focal_length,
@@ -597,29 +620,21 @@ def overlay_meshes(frame, hands, renderer):
     return overlay_bgr, 0
 
 
-def draw_hand_annotations(frame, hands) -> None:
+def hand_color(is_right: int) -> Tuple[int, int, int]:
+    return (42, 180, 96) if is_right else (42, 130, 220)
+
+
+def point_in_loose_frame(point, width: int, height: int) -> bool:
+    return -width <= point[0] <= 2 * width and -height <= point[1] <= 2 * height
+
+
+def draw_hand_skeleton(frame, hands) -> None:
     import cv2
     import numpy as np
 
     height, width = frame.shape[:2]
     for hand in hands:
-        color = (42, 180, 96) if hand["is_right"] else (42, 130, 220)
-        bbox = hand["bbox"].astype(float)
-        x1, y1, x2, y2 = [int(round(v)) for v in bbox]
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        label = f"{'R' if hand['is_right'] else 'L'} {float(hand['score']):.2f}"
-        label_y = max(16, y1 - 6)
-        cv2.putText(
-            frame,
-            label,
-            (max(0, x1), label_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
-
+        color = hand_color(int(hand["is_right"]))
         points = hand["joints_2d"]
         finite = np.isfinite(points).all(axis=1)
         for start, end in HAND_SKELETON:
@@ -629,11 +644,8 @@ def draw_hand_annotations(frame, hands) -> None:
                 continue
             p1 = points[start]
             p2 = points[end]
-            if (
-                -width <= p1[0] <= 2 * width
-                and -height <= p1[1] <= 2 * height
-                and -width <= p2[0] <= 2 * width
-                and -height <= p2[1] <= 2 * height
+            if point_in_loose_frame(p1, width, height) and point_in_loose_frame(
+                p2, width, height
             ):
                 cv2.line(
                     frame,
@@ -646,7 +658,7 @@ def draw_hand_annotations(frame, hands) -> None:
         for point in points:
             if not np.isfinite(point).all():
                 continue
-            if -width <= point[0] <= 2 * width and -height <= point[1] <= 2 * height:
+            if point_in_loose_frame(point, width, height):
                 cv2.circle(
                     frame,
                     (int(round(point[0])), int(round(point[1]))),
@@ -663,6 +675,279 @@ def draw_hand_annotations(frame, hands) -> None:
                     -1,
                     cv2.LINE_AA,
                 )
+
+
+def draw_camera_coord_labels(frame, hands) -> None:
+    import cv2
+    import numpy as np
+
+    height, width = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.34
+    thickness = 1
+    pad = 2
+    for hand in hands:
+        if "joints_cam" not in hand:
+            continue
+        color = hand_color(int(hand["is_right"]))
+        points_2d = hand["joints_2d"]
+        joints_cam = hand["joints_cam"]
+        joint_count = min(len(points_2d), len(joints_cam), 21)
+        for joint_idx in range(joint_count):
+            point = points_2d[joint_idx]
+            coord = joints_cam[joint_idx]
+            if not np.isfinite(point).all() or not np.isfinite(coord).all():
+                continue
+            if float(coord[2]) <= 0.0:
+                continue
+            if not point_in_loose_frame(point, width, height):
+                continue
+            text = (
+                f"{joint_idx}:("
+                f"{float(coord[0]):.2f},{float(coord[1]):.2f},{float(coord[2]):.2f})"
+            )
+            text_size, baseline = cv2.getTextSize(text, font, font_scale, thickness)
+            text_w, text_h = text_size
+            x = int(round(point[0])) + 4
+            y = int(round(point[1])) - 4
+            x = max(0, min(width - text_w - 2 * pad, x))
+            y = max(text_h + 2 * pad, min(height - baseline - pad, y))
+            cv2.rectangle(
+                frame,
+                (x - pad, y - text_h - pad),
+                (x + text_w + pad, y + baseline + pad),
+                (0, 0, 0),
+                -1,
+            )
+            cv2.putText(frame, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
+
+
+def draw_public_overlay_frames(frame, hands, renderer) -> Tuple[Dict[str, Any], Optional[Exception]]:
+    if not hands:
+        return {
+            "handmesh_overlay": frame,
+            "hand_skeleton_overlay": frame,
+            "handmesh_fitted_camera_coords_overlay": frame,
+            "hand_skeleton_fitted_camera_coords_overlay": frame,
+        }, None
+
+    skeleton = frame.copy()
+    draw_hand_skeleton(skeleton, hands)
+
+    skeleton_coords = skeleton.copy()
+    draw_camera_coord_labels(skeleton_coords, hands)
+
+    render_error: Optional[Exception] = None
+    try:
+        mesh, _ = overlay_meshes(frame, hands, renderer)
+    except Exception as exc:
+        render_error = exc
+        mesh = frame.copy()
+
+    if render_error is not None:
+        mesh_coords = frame.copy()
+    else:
+        mesh_coords = mesh.copy()
+        draw_hand_skeleton(mesh_coords, hands)
+        draw_camera_coord_labels(mesh_coords, hands)
+
+    return {
+        "handmesh_overlay": mesh,
+        "hand_skeleton_overlay": skeleton,
+        "handmesh_fitted_camera_coords_overlay": mesh_coords,
+        "hand_skeleton_fitted_camera_coords_overlay": skeleton_coords,
+    }, render_error
+
+
+def update_manifest_public_outputs(manifest: Dict[str, Any], sample_dir: Path) -> None:
+    outputs = manifest.setdefault("outputs", {})
+    public_paths = common.wilor_public_video_paths(sample_dir)
+    for key, path in public_paths.items():
+        outputs[f"{key}_video"] = str(path)
+    outputs["overlay_video"] = str(public_paths["hand_skeleton_overlay"])
+    outputs.setdefault("legacy_overlay_video", str(sample_dir / "handpose_skeleton_overlay.mp4"))
+    manifest["output_videos"] = common.wilor_output_videos_manifest(sample_dir)
+    manifest["omitted_output_videos"] = common.wilor_omitted_output_videos_manifest()
+
+
+def prepare_public_video_writers(
+    sample_dir: Path,
+    *,
+    fps: float,
+    width: int,
+    height: int,
+    overwrite: bool,
+):
+    import cv2
+
+    output_paths = common.wilor_public_video_paths(sample_dir)
+    for path in output_paths.values():
+        if path.exists():
+            if overwrite:
+                path.unlink()
+            else:
+                raise FileExistsError(f"Public overlay already exists: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writers = {
+        key: cv2.VideoWriter(str(path), fourcc, fps, (width, height))
+        for key, path in output_paths.items()
+    }
+    failed = [key for key, writer in writers.items() if not writer.isOpened()]
+    if failed:
+        for writer in writers.values():
+            writer.release()
+        raise RuntimeError(f"Could not create public overlay videos: {', '.join(failed)}")
+    return writers
+
+
+def close_video_writers(writers) -> None:
+    for writer in writers.values():
+        writer.release()
+
+
+def write_public_video_frames(writers, frames: Dict[str, Any]) -> None:
+    for key in common.WILOR_PUBLIC_VIDEO_OUTPUTS:
+        writers[key].write(frames[key])
+
+
+def load_overlay_renderer():
+    import numpy as np
+
+    from wilor.configs import get_config
+    from wilor.utils.renderer import Renderer
+
+    model_cfg = get_config(str(common.WILOR_CONFIG), update_cachedir=True)
+    mano_path = common.MANO_DATA_DIR / "MANO_RIGHT.pkl"
+    with mano_path.open("rb") as f:
+        mano_data = pickle.load(f, encoding="latin1")
+    faces = np.asarray(mano_data["f"], dtype=np.int32)
+    return Renderer(model_cfg, faces=faces), model_cfg
+
+
+def scaled_focal_length(model_cfg, width: int, height: int) -> float:
+    return float(model_cfg.EXTRA.FOCAL_LENGTH) / float(model_cfg.MODEL.IMAGE_SIZE) * float(
+        max(width, height)
+    )
+
+
+def normalize_focal_length(values, det_count: int, default_focal_length: float):
+    import numpy as np
+
+    if values is None:
+        return np.full((det_count,), default_focal_length, dtype=np.float32)
+    values = np.asarray(values, dtype=np.float32)
+    if values.ndim == 0:
+        return np.full((det_count,), float(values), dtype=np.float32)
+    values = values.reshape(-1)
+    if len(values) == det_count:
+        return values.astype(np.float32)
+    if len(values) == 1:
+        return np.full((det_count,), float(values[0]), dtype=np.float32)
+    return np.full((det_count,), default_focal_length, dtype=np.float32)
+
+
+def load_detection_arrays(
+    detections_npz: Path,
+    *,
+    default_focal_length: float,
+) -> Tuple[Dict[str, Any], bool]:
+    import numpy as np
+
+    with np.load(detections_npz, allow_pickle=False) as data:
+        arrays: Dict[str, Any] = {name: data[name] for name in data.files}
+        original_files = set(data.files)
+
+    det_count = int(len(arrays.get("frame_index", [])))
+    needs_update = False
+
+    if "joints_cam" not in arrays:
+        joints_3d = np.asarray(arrays.get("joints_3d", np.zeros((det_count, 21, 3))))
+        cam_t = np.asarray(arrays.get("cam_t", np.zeros((det_count, 3))))
+        if det_count:
+            arrays["joints_cam"] = (
+                joints_3d.astype(np.float32) + cam_t.astype(np.float32).reshape(det_count, 1, 3)
+            )
+        else:
+            arrays["joints_cam"] = np.zeros((0, 21, 3), dtype=np.float32)
+        needs_update = True
+    else:
+        arrays["joints_cam"] = np.asarray(arrays["joints_cam"], dtype=np.float32)
+
+    focal_values = arrays.get("focal_length")
+    arrays["focal_length"] = normalize_focal_length(
+        focal_values,
+        det_count,
+        default_focal_length,
+    )
+    if "focal_length" not in original_files:
+        needs_update = True
+
+    return arrays, needs_update
+
+
+def rewrite_detection_npz_if_needed(detections_npz: Path, arrays: Dict[str, Any], needs_update: bool) -> None:
+    if not needs_update:
+        return
+    import numpy as np
+
+    np.savez_compressed(detections_npz, **arrays)
+
+
+def read_frame_records(frames_jsonl: Path) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    with frames_jsonl.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+def scalar_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except Exception:
+        try:
+            return int(value.reshape(()))
+        except Exception:
+            return default
+
+
+def detection_indices_for_frame(
+    arrays: Dict[str, Any],
+    record: Dict[str, Any],
+    frame_index: int,
+) -> Iterable[int]:
+    import numpy as np
+
+    if "det_start" in record and "det_end" in record:
+        return range(int(record["det_start"]), int(record["det_end"]))
+    frame_indices = np.asarray(arrays["frame_index"])
+    return np.flatnonzero(frame_indices == frame_index).tolist()
+
+
+def hands_from_detection_arrays(
+    arrays: Dict[str, Any],
+    record: Dict[str, Any],
+    frame_index: int,
+) -> List[Dict[str, Any]]:
+    hands: List[Dict[str, Any]] = []
+    for det_idx in detection_indices_for_frame(arrays, record, frame_index):
+        hands.append(
+            {
+                "is_right": int(arrays["is_right"][det_idx]),
+                "cam_t": arrays["cam_t"][det_idx].astype("float32"),
+                "joints_2d": arrays["joints_2d"][det_idx].astype("float32"),
+                "joints_cam": arrays["joints_cam"][det_idx].astype("float32"),
+                "vertices": arrays["vertices"][det_idx].astype("float32"),
+                "focal_length": float(arrays["focal_length"][det_idx]),
+            }
+        )
+    return hands
 
 
 def run_inference(
@@ -690,8 +975,8 @@ def run_inference(
 
     manifest_path = sample_dir / "manifest.json"
     manifest = common.read_json(manifest_path)
+    update_manifest_public_outputs(manifest, sample_dir)
     workspace_video = Path(manifest["outputs"]["workspace_video"])
-    overlay_video = Path(manifest["outputs"]["overlay_video"])
     results_dir = Path(manifest["outputs"]["summary_json"]).parent
 
     if results_dir.exists() and overwrite:
@@ -699,11 +984,6 @@ def run_inference(
     elif (results_dir / "summary.json").exists() and not overwrite:
         raise FileExistsError(f"Results already exist: {results_dir}")
     results_dir.mkdir(parents=True, exist_ok=True)
-
-    if overlay_video.exists() and overwrite:
-        overlay_video.unlink()
-    elif overlay_video.exists() and not overwrite:
-        raise FileExistsError(f"Overlay already exists: {overlay_video}")
 
     cap = cv2.VideoCapture(str(workspace_video))
     if not cap.isOpened():
@@ -716,12 +996,6 @@ def run_inference(
     if width <= 0 or height <= 0:
         cap.release()
         raise RuntimeError(f"Could not read video dimensions: {workspace_video}")
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(overlay_video), fourcc, fps, (width, height))
-    if not writer.isOpened():
-        cap.release()
-        raise RuntimeError(f"Could not create overlay video: {overlay_video}")
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     print(f"loading WiLoR on {device}")
@@ -750,6 +1024,14 @@ def run_inference(
     model.eval()
     renderer = Renderer(model_cfg, faces=model.mano.faces)
 
+    writers = prepare_public_video_writers(
+        sample_dir,
+        fps=fps,
+        width=width,
+        height=height,
+        overwrite=overwrite,
+    )
+
     frame_indices: List[int] = []
     det_indices: List[int] = []
     bbox_xyxy: List[Any] = []
@@ -757,8 +1039,10 @@ def run_inference(
     is_right_values: List[int] = []
     cam_t_values: List[Any] = []
     joints_3d_values: List[Any] = []
+    joints_cam_values: List[Any] = []
     joints_2d_values: List[Any] = []
     vertices_values: List[Any] = []
+    focal_length_values: List[float] = []
 
     total_frames = 0
     total_detections = 0
@@ -790,18 +1074,15 @@ def run_inference(
                     fast=fast,
                 )
 
-            if hands:
-                try:
-                    overlay, _ = overlay_meshes(frame, hands, renderer)
-                except Exception as exc:
-                    if render_failures == 0:
-                        print(f"warning: mesh rendering failed, using skeleton-only overlay: {exc}", file=sys.stderr)
-                    render_failures += 1
-                    overlay = frame.copy()
-                draw_hand_annotations(overlay, hands)
-            else:
-                overlay = frame
-            writer.write(overlay)
+            public_frames, render_error = draw_public_overlay_frames(frame, hands, renderer)
+            if render_error is not None:
+                if render_failures == 0:
+                    print(
+                        f"warning: mesh rendering failed, using original frame for mesh overlays: {render_error}",
+                        file=sys.stderr,
+                    )
+                render_failures += 1
+            write_public_video_frames(writers, public_frames)
 
             for det_index, hand in enumerate(hands):
                 frame_indices.append(total_frames)
@@ -811,8 +1092,10 @@ def run_inference(
                 is_right_values.append(int(hand["is_right"]))
                 cam_t_values.append(hand["cam_t"])
                 joints_3d_values.append(hand["joints_3d"])
+                joints_cam_values.append(hand["joints_cam"])
                 joints_2d_values.append(hand["joints_2d"])
                 vertices_values.append(hand["vertices"])
+                focal_length_values.append(float(hand["focal_length"]))
                 if hand["is_right"]:
                     right_detections += 1
                 else:
@@ -843,7 +1126,7 @@ def run_inference(
             if total_frames % 100 == 0:
                 print(f"processed_frames: {total_frames}")
 
-    writer.release()
+    close_video_writers(writers)
     cap.release()
 
     detections_npz = results_dir / "detections.npz"
@@ -868,6 +1151,11 @@ def run_inference(
             if joints_3d_values
             else np.zeros((0, 21, 3), dtype=np.float16)
         ),
+        joints_cam=(
+            np.stack(joints_cam_values).astype(np.float32)
+            if joints_cam_values
+            else np.zeros((0, 21, 3), dtype=np.float32)
+        ),
         joints_2d=(
             np.stack(joints_2d_values).astype(np.float32)
             if joints_2d_values
@@ -878,16 +1166,20 @@ def run_inference(
             if vertices_values
             else np.zeros((0, 778, 3), dtype=np.float16)
         ),
+        focal_length=np.asarray(focal_length_values, dtype=np.float32),
         frame_count=np.array(total_frames, dtype=np.int32),
         fps=np.array(fps, dtype=np.float32),
         width=np.array(width, dtype=np.int32),
         height=np.array(height, dtype=np.int32),
     )
 
+    output_videos = common.wilor_output_videos_manifest(sample_dir)
     summary = {
         "status": "complete",
         "video_path": str(workspace_video),
-        "overlay_video": str(overlay_video),
+        "overlay_video": output_videos["hand_skeleton_overlay"]["path"],
+        "output_videos": output_videos,
+        "omitted_output_videos": common.wilor_omitted_output_videos_manifest(),
         "detections_npz": str(detections_npz),
         "frames_jsonl": str(frames_jsonl),
         "frame_count": int(total_frames),
@@ -914,10 +1206,147 @@ def run_inference(
             "completed_at": summary["completed_at"],
             "exit_code": 0,
             "results": summary,
+            "output_videos": output_videos,
+            "omitted_output_videos": common.wilor_omitted_output_videos_manifest(),
         }
     )
+    update_manifest_public_outputs(manifest, sample_dir)
     common.write_json(manifest_path, manifest)
     print(f"complete: {manifest['video_name']} frames={total_frames} detections={total_detections}")
+
+
+def render_overlays_from_results(*, sample_dir: Path, overwrite: bool) -> None:
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+    os.environ.setdefault("MESA_GL_VERSION_OVERRIDE", "4.1")
+    os.environ.setdefault("PYTHONNOUSERSITE", "1")
+    os.chdir(common.REPO_ROOT)
+
+    import cv2
+
+    manifest_path = sample_dir / "manifest.json"
+    manifest = common.read_json(manifest_path)
+    update_manifest_public_outputs(manifest, sample_dir)
+    outputs = manifest["outputs"]
+    workspace_video = Path(outputs["workspace_video"])
+    detections_npz = Path(outputs.get("detections_npz", sample_dir / "wilor_results" / "detections.npz"))
+    frames_jsonl = Path(outputs.get("frames_jsonl", sample_dir / "wilor_results" / "frames.jsonl"))
+
+    if not workspace_video.is_file():
+        raise FileNotFoundError(f"Workspace video is missing: {workspace_video}")
+    if not detections_npz.is_file():
+        raise FileNotFoundError(f"WiLoR detections are missing: {detections_npz}")
+    if not frames_jsonl.is_file():
+        raise FileNotFoundError(f"WiLoR frame records are missing: {frames_jsonl}")
+
+    records = read_frame_records(frames_jsonl)
+    if not records:
+        raise RuntimeError(f"No frame records found in {frames_jsonl}")
+
+    cap = cv2.VideoCapture(str(workspace_video))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open workspace video: {workspace_video}")
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if fps <= 0:
+        fps = 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if width <= 0 or height <= 0:
+        cap.release()
+        raise RuntimeError(f"Could not read video dimensions: {workspace_video}")
+
+    renderer, model_cfg = load_overlay_renderer()
+    detections, detections_need_update = load_detection_arrays(
+        detections_npz,
+        default_focal_length=scaled_focal_length(model_cfg, width, height),
+    )
+    npz_frame_count = scalar_int(detections.get("frame_count"), default=len(records))
+    if npz_frame_count and npz_frame_count != len(records):
+        cap.release()
+        raise RuntimeError(
+            f"Frame count mismatch: detections.npz frame_count={npz_frame_count}, "
+            f"frames.jsonl lines={len(records)}"
+        )
+    rewrite_detection_npz_if_needed(detections_npz, detections, detections_need_update)
+
+    writers = prepare_public_video_writers(
+        sample_dir,
+        fps=fps,
+        width=width,
+        height=height,
+        overwrite=overwrite,
+    )
+
+    total_frames = 0
+    total_detections = 0
+    render_failures = 0
+    try:
+        for frame_number, record in enumerate(records):
+            ok, frame = cap.read()
+            if not ok:
+                raise RuntimeError(
+                    f"Workspace video ended early at frame {frame_number}; "
+                    f"expected {len(records)} frames"
+                )
+            frame_index = int(record.get("frame_index", frame_number))
+            hands = hands_from_detection_arrays(detections, record, frame_index)
+            total_detections += len(hands)
+            public_frames, render_error = draw_public_overlay_frames(frame, hands, renderer)
+            if render_error is not None:
+                if render_failures == 0:
+                    print(
+                        f"warning: mesh rendering failed, using original frame for mesh overlays: {render_error}",
+                        file=sys.stderr,
+                    )
+                render_failures += 1
+            write_public_video_frames(writers, public_frames)
+            total_frames += 1
+            if total_frames % 100 == 0:
+                print(f"rendered_frames: {total_frames}")
+    finally:
+        close_video_writers(writers)
+        cap.release()
+
+    output_videos = common.wilor_output_videos_manifest(sample_dir)
+    rendered_at = common.utc_now_iso()
+    summary_path = Path(outputs.get("summary_json", sample_dir / "wilor_results" / "summary.json"))
+    summary: Dict[str, Any] = {}
+    if summary_path.is_file():
+        summary = common.read_json(summary_path)
+    summary.update(
+        {
+            "status": summary.get("status", "complete"),
+            "video_path": str(workspace_video),
+            "overlay_video": output_videos["hand_skeleton_overlay"]["path"],
+            "output_videos": output_videos,
+            "omitted_output_videos": common.wilor_omitted_output_videos_manifest(),
+            "detections_npz": str(detections_npz),
+            "frames_jsonl": str(frames_jsonl),
+            "frame_count": int(total_frames),
+            "fps": float(fps),
+            "width": int(width),
+            "height": int(height),
+            "overlay_render_failures": int(render_failures),
+            "overlays_rendered_at": rendered_at,
+        }
+    )
+    common.write_json(summary_path, summary)
+
+    manifest.update(
+        {
+            "status": manifest.get("status", "complete"),
+            "exit_code": int(manifest.get("exit_code", 0)),
+            "results": summary,
+            "output_videos": output_videos,
+            "omitted_output_videos": common.wilor_omitted_output_videos_manifest(),
+            "overlays_rendered_at": rendered_at,
+        }
+    )
+    update_manifest_public_outputs(manifest, sample_dir)
+    common.write_json(manifest_path, manifest)
+    print(
+        f"rendered-overlays: {manifest.get('video_name', sample_dir.name)} "
+        f"frames={total_frames} detections={total_detections}"
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
