@@ -299,15 +299,24 @@ def sample_output_paths(output_root: Path, seq_name: str) -> Dict[str, Path]:
     return paths
 
 
-def wilor_public_video_paths(sample_dir: Path) -> Dict[str, Path]:
+def wilor_public_video_paths(
+    sample_dir: Path,
+    output_keys: Optional[Sequence[str]] = None,
+) -> Dict[str, Path]:
+    keys = tuple(output_keys) if output_keys is not None else tuple(WILOR_PUBLIC_VIDEO_OUTPUTS)
     return {
         key: sample_dir / spec["filename"]
         for key, spec in WILOR_PUBLIC_VIDEO_OUTPUTS.items()
+        if key in keys
     }
 
 
-def wilor_output_videos_manifest(sample_dir: Path) -> Dict[str, Dict[str, Any]]:
-    paths = wilor_public_video_paths(sample_dir)
+def wilor_output_videos_manifest(
+    sample_dir: Path,
+    output_keys: Optional[Sequence[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    paths = wilor_public_video_paths(sample_dir, output_keys=output_keys)
+    keys = tuple(output_keys) if output_keys is not None else tuple(WILOR_PUBLIC_VIDEO_OUTPUTS)
     return {
         key: {
             "path": str(paths[key]),
@@ -315,17 +324,29 @@ def wilor_output_videos_manifest(sample_dir: Path) -> Dict[str, Dict[str, Any]]:
             "coord_source": spec["coord_source"],
         }
         for key, spec in WILOR_PUBLIC_VIDEO_OUTPUTS.items()
+        if key in keys
     }
 
 
-def wilor_omitted_output_videos_manifest() -> Dict[str, Dict[str, str]]:
-    return {
+def wilor_omitted_output_videos_manifest(
+    output_keys: Optional[Sequence[str]] = None,
+) -> Dict[str, Dict[str, str]]:
+    omitted = {
         key: {
             "filename": spec["filename"],
             "reason": spec["reason"],
         }
         for key, spec in WILOR_OMITTED_PUBLIC_VIDEO_OUTPUTS.items()
     }
+    if output_keys is not None:
+        rendered = set(output_keys)
+        for key, spec in WILOR_PUBLIC_VIDEO_OUTPUTS.items():
+            if key not in rendered:
+                omitted[key] = {
+                    "filename": spec["filename"],
+                    "reason": "camera_coords_disabled",
+                }
+    return omitted
 
 
 def annotation_summary(record: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -353,6 +374,7 @@ def write_run_script(
     rescale_factor: float,
     batch_size: int,
     fast: bool,
+    camera_coords: bool,
     overwrite: bool,
 ) -> None:
     args = [
@@ -372,6 +394,8 @@ def write_run_script(
     ]
     if fast:
         args.append("--fast")
+    if not camera_coords:
+        args.append("--no_camera_coords")
     if overwrite:
         args.append("--overwrite")
 

@@ -10,6 +10,8 @@ import pickle
 import shutil
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -50,6 +52,221 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+@contextmanager
+def timed_stage(timings: Dict[str, Any], name: str, metadata: Optional[Dict[str, Any]] = None):
+    start_utc = common.utc_now_iso()
+    start_perf = time.perf_counter()
+    try:
+        yield
+    finally:
+        record: Dict[str, Any] = {
+            "name": name,
+            "start_utc": start_utc,
+            "end_utc": common.utc_now_iso(),
+            "elapsed_sec": time.perf_counter() - start_perf,
+        }
+        if metadata is not None:
+            record["metadata"] = metadata
+        timings.setdefault("stages", []).append(record)
+
+
+def add_elapsed(accumulator: Dict[str, float], name: str, start_perf: float) -> None:
+    accumulator[name] = float(accumulator.get(name, 0.0)) + time.perf_counter() - start_perf
+
+
+def positive_rate(count: int | float, elapsed_sec: Optional[float]) -> Optional[float]:
+    if elapsed_sec is None or elapsed_sec <= 0:
+        return None
+    return float(count) / float(elapsed_sec)
+
+
+def ms_per_item(elapsed_sec: Optional[float], count: int | float) -> Optional[float]:
+    if elapsed_sec is None or elapsed_sec <= 0 or count <= 0:
+        return None
+    return float(elapsed_sec) * 1000.0 / float(count)
+
+
+def stage_elapsed_map(timings: Dict[str, Any]) -> Dict[str, float]:
+    return {
+        str(stage.get("name")): float(stage.get("elapsed_sec", 0.0))
+        for stage in timings.get("stages", [])
+        if isinstance(stage, dict) and stage.get("name")
+    }
+
+
+def add_perf_metric(
+    metrics: Dict[str, Any],
+    name: str,
+    *,
+    elapsed_sec: Optional[float],
+    frames: int,
+    detections: Optional[int] = None,
+    source: str,
+    notes: Optional[str] = None,
+) -> None:
+    if elapsed_sec is None or elapsed_sec < 0:
+        return
+    record: Dict[str, Any] = {
+        "elapsed_sec": float(elapsed_sec),
+        "frames_per_sec": positive_rate(frames, elapsed_sec),
+        "ms_per_frame": ms_per_item(elapsed_sec, frames),
+        "source": source,
+    }
+    if detections is not None:
+        record["detections_per_sec"] = positive_rate(detections, elapsed_sec)
+        record["ms_per_detection"] = ms_per_item(elapsed_sec, detections)
+    if notes:
+        record["notes"] = notes
+    metrics[name] = record
+
+
+def build_wilor_performance_metrics(
+    timings: Dict[str, Any],
+    *,
+    frame_count: Optional[int] = None,
+    detection_count: Optional[int] = None,
+    input_fps: Optional[float] = None,
+) -> Dict[str, Any]:
+    breakdown = timings.get("frame_loop_breakdown") or {}
+    stages = stage_elapsed_map(timings)
+    frames = int(frame_count or breakdown.get("frames") or 0)
+    detections = int(detection_count if detection_count is not None else breakdown.get("detections") or 0)
+    metrics: Dict[str, Any] = {
+        "format": "wilor_performance_metrics_v1",
+        "frame_count": frames,
+        "detection_count": detections,
+        "input_video_fps": float(input_fps) if input_fps else None,
+        "average_detections_per_frame": (float(detections) / frames) if frames > 0 else None,
+        "camera_coords_enabled": bool(timings.get("camera_coords_enabled", True)),
+        "metrics": {},
+    }
+    records = metrics["metrics"]
+    add_perf_metric(
+        records,
+        "end_to_end_run_script",
+        elapsed_sec=(timings.get("run_script") or {}).get("elapsed_sec"),
+        frames=frames,
+        detections=detections,
+        source="run_script_wall_time",
+        notes="Includes process startup, imports, model loading, inference, rendering, video encoding, and manifest updates.",
+    )
+    add_perf_metric(
+        records,
+        "run_inference_total",
+        elapsed_sec=timings.get("total_elapsed_sec"),
+        frames=frames,
+        detections=detections,
+        source="in_process_wall_time",
+        notes="Includes imports, model loading, inference, rendering, and output serialization.",
+    )
+    process_loop_sec = stages.get("process_frames_loop")
+    add_perf_metric(
+        records,
+        "loaded_online_loop_with_render",
+        elapsed_sec=process_loop_sec,
+        frames=frames,
+        detections=detections,
+        source="process_frames_loop",
+        notes="Excludes model loading but includes detection, WiLoR forward, overlays, video writes, and JSON/NPZ accumulation.",
+    )
+    render_sec = float(breakdown.get("draw_public_overlay_frames_sec", 0.0))
+    write_sec = float(breakdown.get("write_public_video_frames_sec", 0.0))
+    if process_loop_sec is not None:
+        no_render_sec = max(0.0, float(process_loop_sec) - render_sec - write_sec)
+        add_perf_metric(
+            records,
+            "loaded_online_no_render_estimate",
+            elapsed_sec=no_render_sec,
+            frames=frames,
+            detections=detections,
+            source="derived_from_process_frames_loop",
+            notes="Derived by subtracting overlay rendering and video writing from the measured loaded frame loop.",
+        )
+    add_perf_metric(
+        records,
+        "detector_only",
+        elapsed_sec=breakdown.get("detect_hands_sec"),
+        frames=frames,
+        detections=detections,
+        source="frame_loop_breakdown.detect_hands_sec",
+    )
+    add_perf_metric(
+        records,
+        "wilor_forward_only",
+        elapsed_sec=breakdown.get("wilor_model_forward_sec"),
+        frames=frames,
+        detections=detections,
+        source="frame_loop_breakdown.wilor_model_forward_sec",
+    )
+    add_perf_metric(
+        records,
+        "wilor_infer_and_camera_coords",
+        elapsed_sec=breakdown.get("wilor_infer_and_camera_coords_sec"),
+        frames=frames,
+        detections=detections,
+        source="frame_loop_breakdown.wilor_infer_and_camera_coords_sec",
+    )
+    add_perf_metric(
+        records,
+        "camera_coordinate_projection",
+        elapsed_sec=breakdown.get("wilor_camera_coordinate_projection_sec"),
+        frames=frames,
+        detections=detections,
+        source="frame_loop_breakdown.wilor_camera_coordinate_projection_sec",
+    )
+    add_perf_metric(
+        records,
+        "keypoint_2d_projection",
+        elapsed_sec=breakdown.get("wilor_2d_projection_sec"),
+        frames=frames,
+        detections=detections,
+        source="frame_loop_breakdown.wilor_2d_projection_sec",
+    )
+    add_perf_metric(
+        records,
+        "overlay_rendering",
+        elapsed_sec=breakdown.get("draw_public_overlay_frames_sec"),
+        frames=frames,
+        detections=detections,
+        source="frame_loop_breakdown.draw_public_overlay_frames_sec",
+    )
+    add_perf_metric(
+        records,
+        "video_write",
+        elapsed_sec=breakdown.get("write_public_video_frames_sec"),
+        frames=frames,
+        detections=detections,
+        source="frame_loop_breakdown.write_public_video_frames_sec",
+    )
+    return metrics
+
+
+def refresh_wilor_performance_metrics(manifest: Dict[str, Any]) -> None:
+    timings = dict(manifest.get("timings") or {})
+    results = dict(manifest.get("results") or {})
+    frame_count = results.get("frame_count")
+    if frame_count is None:
+        frame_count = (timings.get("frame_loop_breakdown") or {}).get("frames")
+    detection_count = results.get("total_detections")
+    if detection_count is None:
+        detection_count = (timings.get("frame_loop_breakdown") or {}).get("detections")
+    input_fps = results.get("fps")
+    if input_fps is None:
+        input_fps = (manifest.get("workspace_video_metadata") or {}).get("fps")
+    perf = build_wilor_performance_metrics(
+        timings,
+        frame_count=frame_count,
+        detection_count=detection_count,
+        input_fps=input_fps,
+    )
+    timings["performance_metrics"] = perf
+    manifest["timings"] = timings
+    if results:
+        results["performance_metrics"] = perf
+        results["timings"] = timings
+        manifest["results"] = results
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dataset_root",
@@ -80,6 +297,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--iou", type=float, default=0.5)
     parser.add_argument("--rescale_factor", type=float, default=2.0)
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument(
+        "--no_camera_coords",
+        action="store_true",
+        help="Skip depth-bearing camera-coordinate keypoint export and coordinate overlays.",
+    )
     parser.add_argument(
         "--no_fast",
         action="store_true",
@@ -126,6 +348,7 @@ def build_parser() -> argparse.ArgumentParser:
     infer_parser.add_argument("--rescale_factor", type=float, default=2.0)
     infer_parser.add_argument("--batch_size", type=int, default=16)
     infer_parser.add_argument("--fast", action="store_true")
+    infer_parser.add_argument("--no_camera_coords", action="store_true")
     infer_parser.add_argument("--overwrite", action="store_true")
     infer_parser.set_defaults(func=cmd_infer_one)
 
@@ -248,6 +471,7 @@ def build_manifest_for_sample(
     rescale_factor: float,
     batch_size: int,
     fast: bool,
+    camera_coords: bool,
     overwrite: bool,
 ) -> Dict[str, Any]:
     seq_name = common.safe_name(video_name)
@@ -282,6 +506,12 @@ def build_manifest_for_sample(
             fps=float(source_metadata["fps"] or workspace_metadata["fps"] or 30.0),
         )
 
+    output_video_keys = (
+        tuple(common.WILOR_PUBLIC_VIDEO_OUTPUTS)
+        if camera_coords
+        else ("handmesh_overlay", "hand_skeleton_overlay")
+    )
+    output_video_path_keys = {f"{key}_video" for key in output_video_keys}
     output_paths = {
         key: str(value)
         for key, value in paths.items()
@@ -296,11 +526,8 @@ def build_manifest_for_sample(
             "overlay_video",
             "legacy_overlay_video",
             "hands_qa_npz",
-            "handmesh_overlay_video",
-            "hand_skeleton_overlay_video",
-            "handmesh_fitted_camera_coords_overlay_video",
-            "hand_skeleton_fitted_camera_coords_overlay_video",
         }
+        or key in output_video_path_keys
     }
     manifest: Dict[str, Any] = {
         "status": "prepared",
@@ -337,10 +564,16 @@ def build_manifest_for_sample(
             "rescale_factor": float(rescale_factor),
             "batch_size": int(batch_size),
             "fast": bool(fast),
+            "camera_coords": bool(camera_coords),
         },
         "outputs": output_paths,
-        "output_videos": common.wilor_output_videos_manifest(paths["sample_dir"]),
-        "omitted_output_videos": common.wilor_omitted_output_videos_manifest(),
+        "output_videos": common.wilor_output_videos_manifest(
+            paths["sample_dir"],
+            output_keys=output_video_keys,
+        ),
+        "omitted_output_videos": common.wilor_omitted_output_videos_manifest(
+            output_keys=output_video_keys,
+        ),
     }
     common.write_json(paths["manifest_json"], manifest)
     common.write_run_script(
@@ -351,6 +584,7 @@ def build_manifest_for_sample(
         rescale_factor=rescale_factor,
         batch_size=batch_size,
         fast=fast,
+        camera_coords=camera_coords,
         overwrite=overwrite,
     )
     return manifest
@@ -366,6 +600,8 @@ def prepare_samples(args: argparse.Namespace) -> List[Dict[str, Any]]:
     fast = not args.no_fast
     manifests: List[Dict[str, Any]] = []
     for name in names:
+        prepare_start_utc = common.utc_now_iso()
+        prepare_t0 = time.perf_counter()
         manifest = build_manifest_for_sample(
             dataset_root=dataset_root,
             output_root=output_root,
@@ -380,8 +616,21 @@ def prepare_samples(args: argparse.Namespace) -> List[Dict[str, Any]]:
             rescale_factor=args.rescale_factor,
             batch_size=args.batch_size,
             fast=fast,
+            camera_coords=not args.no_camera_coords,
             overwrite=args.overwrite,
         )
+        prepare_timing = {
+            "start_utc": prepare_start_utc,
+            "end_utc": common.utc_now_iso(),
+            "elapsed_sec": time.perf_counter() - prepare_t0,
+            "copy_video": bool(args.copy_video),
+            "export_hands": bool(args.export_hands),
+            "camera_coords": bool(not args.no_camera_coords),
+        }
+        manifest_timings = dict(manifest.get("timings") or {})
+        manifest_timings["prepare_sample"] = prepare_timing
+        manifest["timings"] = manifest_timings
+        common.write_json(Path(manifest["outputs"]["manifest_json"]), manifest)
         manifests.append(manifest)
     return manifests
 
@@ -404,14 +653,25 @@ def cmd_run(args: argparse.Namespace) -> int:
         run_script = Path(manifest["outputs"]["run_script"])
         sample_manifest_path = Path(manifest["outputs"]["manifest_json"])
         print(f"running: {manifest['video_name']}")
+        run_start_utc = common.utc_now_iso()
+        run_t0 = time.perf_counter()
         completed = subprocess.run([str(run_script)], cwd=str(common.REPO_ROOT))
+        run_script_timing = {
+            "start_utc": run_start_utc,
+            "end_utc": common.utc_now_iso(),
+            "elapsed_sec": time.perf_counter() - run_t0,
+            "returncode": int(completed.returncode),
+        }
         if completed.returncode != 0:
             current = common.read_json(sample_manifest_path)
+            current_timings = dict(current.get("timings") or {})
+            current_timings["run_script"] = run_script_timing
             current.update(
                 {
                     "status": "failed",
                     "failed_at": common.utc_now_iso(),
                     "exit_code": int(completed.returncode),
+                    "timings": current_timings,
                 }
             )
             common.write_json(sample_manifest_path, current)
@@ -421,18 +681,25 @@ def cmd_run(args: argparse.Namespace) -> int:
                     "manifest": str(sample_manifest_path),
                     "status": "failed",
                     "exit_code": int(completed.returncode),
+                    "elapsed_sec": run_script_timing["elapsed_sec"],
                 }
             )
             write_batch_manifest(args.output_root, batch_records, "failed")
             return completed.returncode
 
         final_manifest = common.read_json(sample_manifest_path)
+        final_timings = dict(final_manifest.get("timings") or {})
+        final_timings["run_script"] = run_script_timing
+        final_manifest["timings"] = final_timings
+        refresh_wilor_performance_metrics(final_manifest)
+        common.write_json(sample_manifest_path, final_manifest)
         batch_records.append(
             {
                 "video_name": manifest["video_name"],
                 "manifest": str(sample_manifest_path),
                 "status": final_manifest.get("status", "complete"),
                 "exit_code": int(final_manifest.get("exit_code", 0)),
+                "elapsed_sec": run_script_timing["elapsed_sec"],
             }
         )
 
@@ -460,6 +727,7 @@ def cmd_infer_one(args: argparse.Namespace) -> int:
         rescale_factor=args.rescale_factor,
         batch_size=args.batch_size,
         fast=args.fast,
+        camera_coords=not args.no_camera_coords,
         overwrite=args.overwrite,
     )
     return 0
@@ -514,6 +782,8 @@ def infer_frame_hands(
     batch_size: int,
     rescale_factor: float,
     fast: bool,
+    camera_coords: bool,
+    stage_times: Optional[Dict[str, float]] = None,
 ):
     import torch
 
@@ -521,6 +791,11 @@ def infer_frame_hands(
     from wilor.utils import recursive_to
     from wilor.utils.renderer import cam_crop_to_full
 
+    def sync_device() -> None:
+        if getattr(device, "type", None) == "cuda":
+            torch.cuda.synchronize(device)
+
+    stage_t0 = time.perf_counter()
     dataset = ViTDetDataset(
         model_cfg,
         frame,
@@ -532,13 +807,24 @@ def infer_frame_hands(
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=batch_size, shuffle=False, num_workers=0
     )
+    if stage_times is not None:
+        add_elapsed(stage_times, "wilor_crop_dataset_sec", stage_t0)
 
     hands: List[Dict[str, Any]] = []
     for batch in dataloader:
+        stage_t0 = time.perf_counter()
         batch = recursive_to(batch, device)
+        if stage_times is not None:
+            add_elapsed(stage_times, "wilor_batch_to_device_sec", stage_t0)
+        sync_device()
+        stage_t0 = time.perf_counter()
         with torch.no_grad():
             out = model(batch)
+        sync_device()
+        if stage_times is not None:
+            add_elapsed(stage_times, "wilor_model_forward_sec", stage_t0)
 
+        stage_t0 = time.perf_counter()
         multiplier = 2 * batch["right"] - 1
         pred_cam = out["pred_cam"].clone()
         pred_cam[:, 1] = multiplier * pred_cam[:, 1]
@@ -562,8 +848,11 @@ def infer_frame_hands(
             .numpy()
             .astype("float32")
         )
+        if stage_times is not None:
+            add_elapsed(stage_times, "wilor_camera_translation_sec", stage_t0)
 
         for n in range(batch["img"].shape[0]):
+            stage_t0 = time.perf_counter()
             det_id = int(batch["personid"][n].detach().cpu().item())
             is_right = int(batch["right"][n].detach().cpu().item() >= 0.5)
             side = 2 * is_right - 1
@@ -575,23 +864,30 @@ def infer_frame_hands(
             joints[:, 0] = side * joints[:, 0]
             cam_t = pred_cam_t_full[n]
             img_res = img_size[n].detach().cpu().numpy().astype("float32")
+            if stage_times is not None:
+                add_elapsed(stage_times, "wilor_extract_predictions_sec", stage_t0)
+            stage_t0 = time.perf_counter()
             joints_2d = project_points_full_img(joints, cam_t, focal_length, img_res)
-            joints_cam = joints.astype("float32") + cam_t.astype("float32").reshape(1, 3)
-            hands.append(
-                {
-                    "det_id": det_id,
-                    "bbox": boxes[det_id],
-                    "score": scores[det_id],
-                    "is_right": is_right,
-                    "cam_t": cam_t,
-                    "joints_3d": joints,
-                    "joints_cam": joints_cam,
-                    "joints_2d": joints_2d,
-                    "vertices": verts,
-                    "focal_length": focal_length,
-                    "img_res": img_res,
-                }
-            )
+            if stage_times is not None:
+                add_elapsed(stage_times, "wilor_2d_projection_sec", stage_t0)
+            hand = {
+                "det_id": det_id,
+                "bbox": boxes[det_id],
+                "score": scores[det_id],
+                "is_right": is_right,
+                "cam_t": cam_t,
+                "joints_3d": joints,
+                "joints_2d": joints_2d,
+                "vertices": verts,
+                "focal_length": focal_length,
+                "img_res": img_res,
+            }
+            if camera_coords:
+                stage_t0 = time.perf_counter()
+                hand["joints_cam"] = joints.astype("float32") + cam_t.astype("float32").reshape(1, 3)
+                if stage_times is not None:
+                    add_elapsed(stage_times, "wilor_camera_coordinate_projection_sec", stage_t0)
+            hands.append(hand)
     hands.sort(key=lambda item: item["det_id"])
     return hands
 
@@ -722,20 +1018,34 @@ def draw_camera_coord_labels(frame, hands) -> None:
             cv2.putText(frame, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
 
 
-def draw_public_overlay_frames(frame, hands, renderer) -> Tuple[Dict[str, Any], Optional[Exception]]:
+def draw_public_overlay_frames(
+    frame,
+    hands,
+    renderer,
+    *,
+    camera_coords: bool,
+) -> Tuple[Dict[str, Any], Optional[Exception]]:
     if not hands:
-        return {
+        frames = {
             "handmesh_overlay": frame,
             "hand_skeleton_overlay": frame,
-            "handmesh_fitted_camera_coords_overlay": frame,
-            "hand_skeleton_fitted_camera_coords_overlay": frame,
-        }, None
+        }
+        if camera_coords:
+            frames.update(
+                {
+                    "handmesh_fitted_camera_coords_overlay": frame,
+                    "hand_skeleton_fitted_camera_coords_overlay": frame,
+                }
+            )
+        return frames, None
 
     skeleton = frame.copy()
     draw_hand_skeleton(skeleton, hands)
 
-    skeleton_coords = skeleton.copy()
-    draw_camera_coord_labels(skeleton_coords, hands)
+    skeleton_coords = None
+    if camera_coords:
+        skeleton_coords = skeleton.copy()
+        draw_camera_coord_labels(skeleton_coords, hands)
 
     render_error: Optional[Exception] = None
     try:
@@ -744,30 +1054,50 @@ def draw_public_overlay_frames(frame, hands, renderer) -> Tuple[Dict[str, Any], 
         render_error = exc
         mesh = frame.copy()
 
-    if render_error is not None:
-        mesh_coords = frame.copy()
-    else:
-        mesh_coords = mesh.copy()
-        draw_hand_skeleton(mesh_coords, hands)
-        draw_camera_coord_labels(mesh_coords, hands)
-
-    return {
+    frames = {
         "handmesh_overlay": mesh,
         "hand_skeleton_overlay": skeleton,
-        "handmesh_fitted_camera_coords_overlay": mesh_coords,
-        "hand_skeleton_fitted_camera_coords_overlay": skeleton_coords,
-    }, render_error
+    }
+    if camera_coords:
+        if render_error is not None:
+            mesh_coords = frame.copy()
+        else:
+            mesh_coords = mesh.copy()
+            draw_hand_skeleton(mesh_coords, hands)
+            draw_camera_coord_labels(mesh_coords, hands)
+        frames.update(
+            {
+                "handmesh_fitted_camera_coords_overlay": mesh_coords,
+                "hand_skeleton_fitted_camera_coords_overlay": skeleton_coords,
+            }
+        )
+    return frames, render_error
 
 
-def update_manifest_public_outputs(manifest: Dict[str, Any], sample_dir: Path) -> None:
+def update_manifest_public_outputs(
+    manifest: Dict[str, Any],
+    sample_dir: Path,
+    *,
+    camera_coords: bool = True,
+) -> None:
     outputs = manifest.setdefault("outputs", {})
-    public_paths = common.wilor_public_video_paths(sample_dir)
+    output_keys = (
+        tuple(common.WILOR_PUBLIC_VIDEO_OUTPUTS)
+        if camera_coords
+        else ("handmesh_overlay", "hand_skeleton_overlay")
+    )
+    public_paths = common.wilor_public_video_paths(sample_dir, output_keys=output_keys)
     for key, path in public_paths.items():
         outputs[f"{key}_video"] = str(path)
     outputs["overlay_video"] = str(public_paths["hand_skeleton_overlay"])
     outputs.setdefault("legacy_overlay_video", str(sample_dir / "handpose_skeleton_overlay.mp4"))
-    manifest["output_videos"] = common.wilor_output_videos_manifest(sample_dir)
-    manifest["omitted_output_videos"] = common.wilor_omitted_output_videos_manifest()
+    manifest["output_videos"] = common.wilor_output_videos_manifest(
+        sample_dir,
+        output_keys=output_keys,
+    )
+    manifest["omitted_output_videos"] = common.wilor_omitted_output_videos_manifest(
+        output_keys=output_keys,
+    )
 
 
 def prepare_public_video_writers(
@@ -776,11 +1106,17 @@ def prepare_public_video_writers(
     fps: float,
     width: int,
     height: int,
+    camera_coords: bool,
     overwrite: bool,
 ):
     import cv2
 
-    output_paths = common.wilor_public_video_paths(sample_dir)
+    output_keys = (
+        tuple(common.WILOR_PUBLIC_VIDEO_OUTPUTS)
+        if camera_coords
+        else ("handmesh_overlay", "hand_skeleton_overlay")
+    )
+    output_paths = common.wilor_public_video_paths(sample_dir, output_keys=output_keys)
     for path in output_paths.values():
         if path.exists():
             if overwrite:
@@ -808,7 +1144,7 @@ def close_video_writers(writers) -> None:
 
 
 def write_public_video_frames(writers, frames: Dict[str, Any]) -> None:
-    for key in common.WILOR_PUBLIC_VIDEO_OUTPUTS:
+    for key in writers:
         writers[key].write(frames[key])
 
 
@@ -958,79 +1294,117 @@ def run_inference(
     rescale_factor: float,
     batch_size: int,
     fast: bool,
+    camera_coords: bool,
     overwrite: bool,
 ) -> None:
+    total_start_utc = common.utc_now_iso()
+    total_t0 = time.perf_counter()
+    timings: Dict[str, Any] = {
+        "format": "wilor_stage_timings_v1",
+        "started_at": total_start_utc,
+        "stages": [],
+    }
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
     os.environ.setdefault("MESA_GL_VERSION_OVERRIDE", "4.1")
     os.environ.setdefault("PYTHONNOUSERSITE", "1")
     os.chdir(common.REPO_ROOT)
 
-    import cv2
-    import numpy as np
-    import torch
-    from ultralytics import YOLO
+    with timed_stage(timings, "import_runtime_modules"):
+        import cv2
+        import numpy as np
+        import torch
+        from ultralytics import YOLO
 
-    from wilor.models import load_wilor
-    from wilor.utils.renderer import Renderer
+        from wilor.models import load_wilor
+        from wilor.utils.renderer import Renderer
 
-    manifest_path = sample_dir / "manifest.json"
-    manifest = common.read_json(manifest_path)
-    update_manifest_public_outputs(manifest, sample_dir)
-    workspace_video = Path(manifest["outputs"]["workspace_video"])
-    results_dir = Path(manifest["outputs"]["summary_json"]).parent
+    with timed_stage(timings, "prepare_manifest_and_output"):
+        manifest_path = sample_dir / "manifest.json"
+        manifest = common.read_json(manifest_path)
+        update_manifest_public_outputs(manifest, sample_dir, camera_coords=camera_coords)
+        workspace_video = Path(manifest["outputs"]["workspace_video"])
+        results_dir = Path(manifest["outputs"]["summary_json"]).parent
 
-    if results_dir.exists() and overwrite:
-        shutil.rmtree(results_dir)
-    elif (results_dir / "summary.json").exists() and not overwrite:
-        raise FileExistsError(f"Results already exist: {results_dir}")
-    results_dir.mkdir(parents=True, exist_ok=True)
+        if results_dir.exists() and overwrite:
+            shutil.rmtree(results_dir)
+        elif (results_dir / "summary.json").exists() and not overwrite:
+            raise FileExistsError(f"Results already exist: {results_dir}")
+        results_dir.mkdir(parents=True, exist_ok=True)
 
-    cap = cv2.VideoCapture(str(workspace_video))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open workspace video: {workspace_video}")
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    if fps <= 0:
-        fps = 30.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    if width <= 0 or height <= 0:
-        cap.release()
-        raise RuntimeError(f"Could not read video dimensions: {workspace_video}")
+    with timed_stage(timings, "open_video"):
+        cap = cv2.VideoCapture(str(workspace_video))
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open workspace video: {workspace_video}")
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        if fps <= 0:
+            fps = 30.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        if width <= 0 or height <= 0:
+            cap.release()
+            raise RuntimeError(f"Could not read video dimensions: {workspace_video}")
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    print(f"loading WiLoR on {device}")
-    model, model_cfg = load_wilor(
-        checkpoint_path=str(common.WILOR_CHECKPOINT),
-        cfg_path=str(common.WILOR_CONFIG),
-    )
-    if fast and device.type == "cuda":
-        torch.set_float32_matmul_precision("high")
-        model = model.half()
-        try:
-            model.backbone = torch.compile(model.backbone)
-        except Exception as exc:
-            print(f"warning: torch.compile failed, continuing without compile: {exc}", file=sys.stderr)
-        try:
-            model.backbone.skip_blocks = True
-        except Exception as exc:
-            print(f"warning: could not enable backbone skip_blocks: {exc}", file=sys.stderr)
-    elif fast:
-        print("warning: fast mode requested without CUDA; using full precision", file=sys.stderr)
-        fast = False
+    with timed_stage(
+        timings,
+        "load_wilor_model",
+        metadata={
+            "device": str(device),
+            "checkpoint": str(common.WILOR_CHECKPOINT),
+            "config": str(common.WILOR_CONFIG),
+        },
+    ):
+        print(f"loading WiLoR on {device}")
+        model, model_cfg = load_wilor(
+            checkpoint_path=str(common.WILOR_CHECKPOINT),
+            cfg_path=str(common.WILOR_CONFIG),
+        )
+    fast_metadata = {"requested_fast": bool(fast), "device": str(device)}
+    with timed_stage(timings, "configure_fast_mode", metadata=fast_metadata):
+        if fast and device.type == "cuda":
+            torch.set_float32_matmul_precision("high")
+            model = model.half()
+            try:
+                model.backbone = torch.compile(model.backbone)
+                fast_metadata["torch_compile_backbone"] = True
+            except Exception as exc:
+                fast_metadata["torch_compile_backbone"] = False
+                fast_metadata["torch_compile_error"] = str(exc)
+                print(f"warning: torch.compile failed, continuing without compile: {exc}", file=sys.stderr)
+            try:
+                model.backbone.skip_blocks = True
+                fast_metadata["skip_blocks"] = True
+            except Exception as exc:
+                fast_metadata["skip_blocks"] = False
+                fast_metadata["skip_blocks_error"] = str(exc)
+                print(f"warning: could not enable backbone skip_blocks: {exc}", file=sys.stderr)
+        elif fast:
+            print("warning: fast mode requested without CUDA; using full precision", file=sys.stderr)
+            fast = False
+        fast_metadata["effective_fast"] = bool(fast)
 
-    detector = YOLO(str(common.WILOR_DETECTOR))
-    model = model.to(device)
-    detector = detector.to(device)
-    model.eval()
-    renderer = Renderer(model_cfg, faces=model.mano.faces)
+    with timed_stage(
+        timings,
+        "load_detector",
+        metadata={"device": str(device), "detector": str(common.WILOR_DETECTOR)},
+    ):
+        detector = YOLO(str(common.WILOR_DETECTOR))
+    with timed_stage(timings, "move_models_to_device", metadata={"device": str(device)}):
+        model = model.to(device)
+        detector = detector.to(device)
+        model.eval()
+    with timed_stage(timings, "init_renderer"):
+        renderer = Renderer(model_cfg, faces=model.mano.faces)
 
-    writers = prepare_public_video_writers(
-        sample_dir,
-        fps=fps,
-        width=width,
-        height=height,
-        overwrite=overwrite,
-    )
+    with timed_stage(timings, "prepare_public_video_writers"):
+        writers = prepare_public_video_writers(
+            sample_dir,
+            fps=fps,
+            width=width,
+            height=height,
+            camera_coords=camera_coords,
+            overwrite=overwrite,
+        )
 
     frame_indices: List[int] = []
     det_indices: List[int] = []
@@ -1050,136 +1424,201 @@ def run_inference(
     right_detections = 0
     render_failures = 0
     frames_jsonl = results_dir / "frames.jsonl"
+    frame_loop_breakdown: Dict[str, Any] = {
+        "read_frame_sec": 0.0,
+        "detect_hands_sec": 0.0,
+        "wilor_infer_and_camera_coords_sec": 0.0,
+        "wilor_crop_dataset_sec": 0.0,
+        "wilor_batch_to_device_sec": 0.0,
+        "wilor_model_forward_sec": 0.0,
+        "wilor_camera_translation_sec": 0.0,
+        "wilor_extract_predictions_sec": 0.0,
+        "wilor_2d_projection_sec": 0.0,
+        "wilor_camera_coordinate_projection_sec": 0.0,
+        "draw_public_overlay_frames_sec": 0.0,
+        "write_public_video_frames_sec": 0.0,
+        "record_outputs_sec": 0.0,
+    }
 
-    with frames_jsonl.open("w", encoding="utf-8") as frames_out:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+    with timed_stage(timings, "process_frames_loop"):
+        with frames_jsonl.open("w", encoding="utf-8") as frames_out:
+            while True:
+                stage_t0 = time.perf_counter()
+                ok, frame = cap.read()
+                add_elapsed(frame_loop_breakdown, "read_frame_sec", stage_t0)
+                if not ok:
+                    break
 
-            det_start = len(frame_indices)
-            boxes, det_scores, right = detect_hands(detector, frame, conf=conf, iou=iou)
-            hands: List[Dict[str, Any]] = []
-            if len(boxes) > 0:
-                hands = infer_frame_hands(
-                    frame=frame,
-                    boxes=boxes,
-                    scores=det_scores,
-                    right=right,
-                    model=model,
-                    model_cfg=model_cfg,
-                    device=device,
-                    batch_size=batch_size,
-                    rescale_factor=rescale_factor,
-                    fast=fast,
-                )
+                det_start = len(frame_indices)
+                stage_t0 = time.perf_counter()
+                boxes, det_scores, right = detect_hands(detector, frame, conf=conf, iou=iou)
+                add_elapsed(frame_loop_breakdown, "detect_hands_sec", stage_t0)
 
-            public_frames, render_error = draw_public_overlay_frames(frame, hands, renderer)
-            if render_error is not None:
-                if render_failures == 0:
-                    print(
-                        f"warning: mesh rendering failed, using original frame for mesh overlays: {render_error}",
-                        file=sys.stderr,
+                hands: List[Dict[str, Any]] = []
+                stage_t0 = time.perf_counter()
+                if len(boxes) > 0:
+                    hands = infer_frame_hands(
+                        frame=frame,
+                        boxes=boxes,
+                        scores=det_scores,
+                        right=right,
+                        model=model,
+                        model_cfg=model_cfg,
+                        device=device,
+                        batch_size=batch_size,
+                        rescale_factor=rescale_factor,
+                        fast=fast,
+                        camera_coords=camera_coords,
+                        stage_times=frame_loop_breakdown,
                     )
-                render_failures += 1
-            write_public_video_frames(writers, public_frames)
+                add_elapsed(frame_loop_breakdown, "wilor_infer_and_camera_coords_sec", stage_t0)
 
-            for det_index, hand in enumerate(hands):
-                frame_indices.append(total_frames)
-                det_indices.append(det_index)
-                bbox_xyxy.append(hand["bbox"])
-                scores.append(float(hand["score"]))
-                is_right_values.append(int(hand["is_right"]))
-                cam_t_values.append(hand["cam_t"])
-                joints_3d_values.append(hand["joints_3d"])
-                joints_cam_values.append(hand["joints_cam"])
-                joints_2d_values.append(hand["joints_2d"])
-                vertices_values.append(hand["vertices"])
-                focal_length_values.append(float(hand["focal_length"]))
-                if hand["is_right"]:
-                    right_detections += 1
-                else:
-                    left_detections += 1
-
-            det_end = len(frame_indices)
-            num_detections = det_end - det_start
-            total_detections += num_detections
-            frames_out.write(
-                json.dumps(
-                    {
-                        "frame_index": total_frames,
-                        "source_frame_index": int(
-                            manifest.get("debug_clip", {}).get("start_frame", 0)
-                            + total_frames
-                        ),
-                        "time_sec": total_frames / fps,
-                        "num_detections": num_detections,
-                        "det_start": det_start,
-                        "det_end": det_end,
-                    },
-                    sort_keys=True,
+                stage_t0 = time.perf_counter()
+                public_frames, render_error = draw_public_overlay_frames(
+                    frame,
+                    hands,
+                    renderer,
+                    camera_coords=camera_coords,
                 )
-                + "\n"
-            )
+                if render_error is not None:
+                    if render_failures == 0:
+                        print(
+                            f"warning: mesh rendering failed, using original frame for mesh overlays: {render_error}",
+                            file=sys.stderr,
+                        )
+                    render_failures += 1
+                add_elapsed(frame_loop_breakdown, "draw_public_overlay_frames_sec", stage_t0)
 
-            total_frames += 1
-            if total_frames % 100 == 0:
-                print(f"processed_frames: {total_frames}")
+                stage_t0 = time.perf_counter()
+                write_public_video_frames(writers, public_frames)
+                add_elapsed(frame_loop_breakdown, "write_public_video_frames_sec", stage_t0)
 
-    close_video_writers(writers)
-    cap.release()
+                stage_t0 = time.perf_counter()
+                for det_index, hand in enumerate(hands):
+                    frame_indices.append(total_frames)
+                    det_indices.append(det_index)
+                    bbox_xyxy.append(hand["bbox"])
+                    scores.append(float(hand["score"]))
+                    is_right_values.append(int(hand["is_right"]))
+                    cam_t_values.append(hand["cam_t"])
+                    joints_3d_values.append(hand["joints_3d"])
+                    if camera_coords and "joints_cam" in hand:
+                        joints_cam_values.append(hand["joints_cam"])
+                    joints_2d_values.append(hand["joints_2d"])
+                    vertices_values.append(hand["vertices"])
+                    focal_length_values.append(float(hand["focal_length"]))
+                    if hand["is_right"]:
+                        right_detections += 1
+                    else:
+                        left_detections += 1
+
+                det_end = len(frame_indices)
+                num_detections = det_end - det_start
+                total_detections += num_detections
+                frames_out.write(
+                    json.dumps(
+                        {
+                            "frame_index": total_frames,
+                            "source_frame_index": int(
+                                manifest.get("debug_clip", {}).get("start_frame", 0)
+                                + total_frames
+                            ),
+                            "time_sec": total_frames / fps,
+                            "num_detections": num_detections,
+                            "det_start": det_start,
+                            "det_end": det_end,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+                add_elapsed(frame_loop_breakdown, "record_outputs_sec", stage_t0)
+
+                total_frames += 1
+                if total_frames % 100 == 0:
+                    print(f"processed_frames: {total_frames}")
+
+    with timed_stage(timings, "close_video_outputs"):
+        close_video_writers(writers)
+        cap.release()
+    frame_loop_breakdown["frames"] = int(total_frames)
+    frame_loop_breakdown["detections"] = int(total_detections)
+    timings["frame_loop_breakdown"] = frame_loop_breakdown
 
     detections_npz = results_dir / "detections.npz"
-    np.savez_compressed(
-        detections_npz,
-        frame_index=np.asarray(frame_indices, dtype=np.int32),
-        det_index=np.asarray(det_indices, dtype=np.int16),
-        bbox_xyxy=(
-            np.stack(bbox_xyxy).astype(np.float32)
-            if bbox_xyxy
-            else np.zeros((0, 4), dtype=np.float32)
-        ),
-        score=np.asarray(scores, dtype=np.float32),
-        is_right=np.asarray(is_right_values, dtype=np.int8),
-        cam_t=(
-            np.stack(cam_t_values).astype(np.float32)
-            if cam_t_values
-            else np.zeros((0, 3), dtype=np.float32)
-        ),
-        joints_3d=(
-            np.stack(joints_3d_values).astype(np.float16)
-            if joints_3d_values
-            else np.zeros((0, 21, 3), dtype=np.float16)
-        ),
-        joints_cam=(
-            np.stack(joints_cam_values).astype(np.float32)
-            if joints_cam_values
-            else np.zeros((0, 21, 3), dtype=np.float32)
-        ),
-        joints_2d=(
-            np.stack(joints_2d_values).astype(np.float32)
-            if joints_2d_values
-            else np.zeros((0, 21, 2), dtype=np.float32)
-        ),
-        vertices=(
-            np.stack(vertices_values).astype(np.float16)
-            if vertices_values
-            else np.zeros((0, 778, 3), dtype=np.float16)
-        ),
-        focal_length=np.asarray(focal_length_values, dtype=np.float32),
-        frame_count=np.array(total_frames, dtype=np.int32),
-        fps=np.array(fps, dtype=np.float32),
-        width=np.array(width, dtype=np.int32),
-        height=np.array(height, dtype=np.int32),
-    )
+    with timed_stage(timings, "save_detections_npz"):
+        detection_arrays = {
+            "frame_index": np.asarray(frame_indices, dtype=np.int32),
+            "det_index": np.asarray(det_indices, dtype=np.int16),
+            "bbox_xyxy": (
+                np.stack(bbox_xyxy).astype(np.float32)
+                if bbox_xyxy
+                else np.zeros((0, 4), dtype=np.float32)
+            ),
+            "score": np.asarray(scores, dtype=np.float32),
+            "is_right": np.asarray(is_right_values, dtype=np.int8),
+            "cam_t": (
+                np.stack(cam_t_values).astype(np.float32)
+                if cam_t_values
+                else np.zeros((0, 3), dtype=np.float32)
+            ),
+            "joints_3d": (
+                np.stack(joints_3d_values).astype(np.float16)
+                if joints_3d_values
+                else np.zeros((0, 21, 3), dtype=np.float16)
+            ),
+            "joints_2d": (
+                np.stack(joints_2d_values).astype(np.float32)
+                if joints_2d_values
+                else np.zeros((0, 21, 2), dtype=np.float32)
+            ),
+            "vertices": (
+                np.stack(vertices_values).astype(np.float16)
+                if vertices_values
+                else np.zeros((0, 778, 3), dtype=np.float16)
+            ),
+            "focal_length": np.asarray(focal_length_values, dtype=np.float32),
+            "frame_count": np.array(total_frames, dtype=np.int32),
+            "fps": np.array(fps, dtype=np.float32),
+            "width": np.array(width, dtype=np.int32),
+            "height": np.array(height, dtype=np.int32),
+        }
+        if camera_coords:
+            detection_arrays["joints_cam"] = (
+                np.stack(joints_cam_values).astype(np.float32)
+                if joints_cam_values
+                else np.zeros((0, 21, 3), dtype=np.float32)
+            )
+        np.savez_compressed(detections_npz, **detection_arrays)
 
-    output_videos = common.wilor_output_videos_manifest(sample_dir)
+    output_video_keys = (
+        tuple(common.WILOR_PUBLIC_VIDEO_OUTPUTS)
+        if camera_coords
+        else ("handmesh_overlay", "hand_skeleton_overlay")
+    )
+    output_videos = common.wilor_output_videos_manifest(
+        sample_dir,
+        output_keys=output_video_keys,
+    )
+    omitted_output_videos = common.wilor_omitted_output_videos_manifest(
+        output_keys=output_video_keys,
+    )
+    timings["camera_coords_enabled"] = bool(camera_coords)
+    timings["completed_at"] = common.utc_now_iso()
+    timings["total_elapsed_sec"] = time.perf_counter() - total_t0
+    performance_metrics = build_wilor_performance_metrics(
+        timings,
+        frame_count=total_frames,
+        detection_count=total_detections,
+        input_fps=fps,
+    )
+    timings["performance_metrics"] = performance_metrics
     summary = {
         "status": "complete",
         "video_path": str(workspace_video),
         "overlay_video": output_videos["hand_skeleton_overlay"]["path"],
         "output_videos": output_videos,
-        "omitted_output_videos": common.wilor_omitted_output_videos_manifest(),
+        "omitted_output_videos": omitted_output_videos,
         "detections_npz": str(detections_npz),
         "frames_jsonl": str(frames_jsonl),
         "frame_count": int(total_frames),
@@ -1195,8 +1634,11 @@ def run_inference(
         "rescale_factor": float(rescale_factor),
         "batch_size": int(batch_size),
         "fast": bool(fast),
+        "camera_coords_enabled": bool(camera_coords),
         "device": str(device),
-        "completed_at": common.utc_now_iso(),
+        "performance_metrics": performance_metrics,
+        "timings": timings,
+        "completed_at": timings["completed_at"],
     }
     common.write_json(results_dir / "summary.json", summary)
 
@@ -1207,10 +1649,16 @@ def run_inference(
             "exit_code": 0,
             "results": summary,
             "output_videos": output_videos,
-            "omitted_output_videos": common.wilor_omitted_output_videos_manifest(),
+            "omitted_output_videos": omitted_output_videos,
+            "wilor": {
+                **manifest.get("wilor", {}),
+                "camera_coords": bool(camera_coords),
+            },
+            "timings": timings,
         }
     )
-    update_manifest_public_outputs(manifest, sample_dir)
+    refresh_wilor_performance_metrics(manifest)
+    update_manifest_public_outputs(manifest, sample_dir, camera_coords=camera_coords)
     common.write_json(manifest_path, manifest)
     print(f"complete: {manifest['video_name']} frames={total_frames} detections={total_detections}")
 
