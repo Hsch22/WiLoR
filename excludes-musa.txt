@@ -1,0 +1,26 @@
+# Never resolve these into the WiLoR project .venv on MUSA.
+torch
+torchvision
+torch-musa
+torch_musa
+torchaudio
+triton
+opencv-python
+cuda-bindings
+cuda-pathfinder
+cuda-toolkit
+nvidia-cublas
+nvidia-cuda-cupti
+nvidia-cuda-nvrtc
+nvidia-cuda-runtime
+nvidia-cudnn-cu13
+nvidia-cufft
+nvidia-cufile
+nvidia-curand
+nvidia-cusolver
+nvidia-cusparse
+nvidia-cusparselt-cu13
+nvidia-nccl-cu13
+nvidia-nvjitlink
+nvidia-nvshmem-cu13
+nvidia-nvtx

@@ -47,6 +47,39 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu117
 # Install requirements
 pip install -r requirements.txt
 ```
+
+### uv on Moore Threads MUSA
+
+On the `/datapool` Moore Threads workers, use the shared mtwan image so the
+project virtual environment can reuse the image-provided MUSA PyTorch stack:
+
+```bash
+cd /datapool/husicheng/WiLoR
+source /datapool/.config/mihomo/proxy-env.sh
+
+bash scripts/bootstrap_musa_uv.sh
+```
+
+Do not install CUDA PyTorch wheels in this environment. The bootstrap script
+uses `--system-site-packages`, `constraints-musa.txt`, and `excludes-musa.txt`
+so `.venv` sees `torch`, `torchvision`, and `torch_musa` from the mtwan image
+without installing PyPI torch/CUDA packages into the project environment.
+`overrides-musa.txt` keeps PyOpenGL on the OSMesa-capable version needed by
+pyrender. The bootstrap also caches and extracts the Ubuntu 22.04
+EGL/GLVND/OSMesa runtime `.deb` packages under
+`/datapool/shared_apt/ubuntu-jammy/wilor-egl-glvnd`; runtime commands load them
+through `LD_LIBRARY_PATH` instead of mutating the container filesystem. The cache
+is populated from domestic Ubuntu mirrors without proxy first, then retried
+through `/datapool/.config/mihomo/proxy-env.sh` only if the direct domestic
+mirrors fail.
+
+Run commands in the same image with:
+
+```bash
+bash scripts/run_musa.sh .venv/bin/python demo.py --img_folder demo_img --out_folder demo_out --save_mesh --fast
+```
+
+More details are in [docs/MUSA_UV_USAGE.md](docs/MUSA_UV_USAGE.md).
 Download the pretrained models using: 
 ```bash
 wget https://huggingface.co/spaces/rolpotamias/WiLoR/resolve/main/pretrained_models/detector.pt -P ./pretrained_models/

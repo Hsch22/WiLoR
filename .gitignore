@@ -1,0 +1,10 @@
+.venv/
+.venv.lock
+*.egg-info/
+__pycache__/
+*.py[cod]
+demo_out/
+out_demo/
+pretrained_models/*.pt
+pretrained_models/*.ckpt
+mano_data/MANO_RIGHT.pkl

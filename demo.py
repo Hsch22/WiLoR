@@ -8,7 +8,7 @@ import json
 from typing import Dict, Optional
 
 from wilor.models import WiLoR, load_wilor
-from wilor.utils import recursive_to
+from wilor.utils import get_torch_device, recursive_to
 from wilor.datasets.vitdet_dataset import ViTDetDataset, DEFAULT_MEAN, DEFAULT_STD
 from wilor.utils.renderer import Renderer, cam_crop_to_full
 from ultralytics import YOLO 
@@ -32,12 +32,16 @@ def main():
         model.backbone = torch.compile(model.backbone)
         model.backbone.skip_blocks = True 
         
+    # The bundled Ultralytics 8.1 detector checkpoint stores model classes.
+    # PyTorch 2.6+ defaults torch.load to weights_only=True, so allow legacy
+    # loading for this trusted local checkpoint.
+    os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
     detector = YOLO('./pretrained_models/detector.pt')
     # Setup the renderer
     renderer = Renderer(model_cfg, faces=model.mano.faces)
     renderer_side = Renderer(model_cfg, faces=model.mano.faces)
     
-    device   = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    device   = get_torch_device()
     model    = model.to(device)
     detector = detector.to(device)
     model.eval()

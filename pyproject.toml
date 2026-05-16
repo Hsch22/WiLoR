@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wilor"
+version = "0.1.0"
+description = "End-to-end 3D hand localization and reconstruction in-the-wild"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "numpy<2",
+    "opencv-python-headless==4.11.0.86",
+    "pyrender",
+    "pytorch-lightning",
+    "scikit-image",
+    "smplx==0.1.28",
+    "yacs",
+    "chumpy @ git+https://github.com/mattloper/chumpy.git",
+    "timm",
+    "einops",
+    "xtcocotools",
+    "pandas",
+    "hydra-core",
+    "hydra-submitit-launcher",
+    "hydra-colorlog",
+    "pyrootutils",
+    "rich",
+    "webdataset",
+    "gradio",
+    "socksio",
+    "ultralytics==8.1.34",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["wilor*"]
+
+[tool.uv.extra-build-dependencies]
+chumpy = ["pip"]

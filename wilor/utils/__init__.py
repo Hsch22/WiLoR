@@ -1,6 +1,7 @@
 import torch
 from typing import Any
 
+from .device import get_torch_device
 from .renderer import Renderer
 from .mesh_renderer import MeshRenderer
 from .skeleton_renderer import SkeletonRenderer

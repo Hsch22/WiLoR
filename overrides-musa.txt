@@ -1,0 +1,3 @@
+# pyrender declares PyOpenGL==3.1.0, but its OSMesa backend imports
+# OSMesaCreateContextAttribs, which is exposed by newer PyOpenGL releases.
+PyOpenGL==3.1.7

@@ -1,6 +1,6 @@
 import os
 if 'PYOPENGL_PLATFORM' not in os.environ:
-    os.environ['PYOPENGL_PLATFORM'] = 'egl'
+    os.environ['PYOPENGL_PLATFORM'] = 'osmesa'
 import torch
 import numpy as np
 import pyrender
@@ -133,6 +133,13 @@ def create_raymond_lights() -> List[pyrender.Node]:
 
     return nodes
 
+def ensure_rgba(color: np.ndarray, depth: np.ndarray) -> np.ndarray:
+    color = color.astype(np.float32) / 255.0
+    if color.shape[-1] == 4:
+        return color
+    alpha = (depth > 0).astype(np.float32)[..., None]
+    return np.concatenate([color[..., :3], alpha], axis=-1)
+
 class Renderer:
 
     def __init__(self, cfg: CfgNode, faces: np.array):
@@ -232,7 +239,7 @@ class Renderer:
             scene.add_node(node)
 
         color, rend_depth = renderer.render(scene, flags=pyrender.RenderFlags.RGBA)
-        color = color.astype(np.float32) / 255.0
+        color = ensure_rgba(color, rend_depth)
         renderer.delete()
 
         if return_rgba:
@@ -326,7 +333,7 @@ class Renderer:
             scene.add_node(node)
 
         color, rend_depth = renderer.render(scene, flags=pyrender.RenderFlags.RGBA)
-        color = color.astype(np.float32) / 255.0
+        color = ensure_rgba(color, rend_depth)
         renderer.delete()
 
         return color
@@ -380,7 +387,7 @@ class Renderer:
             scene.add_node(node)
 
         color, rend_depth = renderer.render(scene, flags=pyrender.RenderFlags.RGBA)
-        color = color.astype(np.float32) / 255.0
+        color = ensure_rgba(color, rend_depth)
         renderer.delete()
 
         return color

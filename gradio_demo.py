@@ -17,10 +17,10 @@ import json
 from typing import Dict, Optional
 
 from wilor.models import WiLoR, load_wilor
-from wilor.utils import recursive_to
+from wilor.utils import get_torch_device, recursive_to
 from wilor.datasets.vitdet_dataset import ViTDetDataset, DEFAULT_MEAN, DEFAULT_STD
 from wilor.utils.renderer import Renderer, cam_crop_to_full
-device = torch.device('cpu') if torch.cuda.is_available() else torch.device('cuda')
+device = get_torch_device()
 
 LIGHT_PURPLE=(0.25098039,  0.274117647,  0.65882353)
 
@@ -30,6 +30,10 @@ renderer = Renderer(model_cfg, faces=model.mano.faces)
 model = model.to(device)
 model.eval()
 
+# The bundled Ultralytics 8.1 detector checkpoint stores model classes.
+# PyTorch 2.6+ defaults torch.load to weights_only=True, so allow legacy
+# loading for this trusted local checkpoint.
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 detector = YOLO(f'./pretrained_models/detector.pt').to(device)
 
 def render_reconstruction(image, conf, IoU_threshold=0.3): 

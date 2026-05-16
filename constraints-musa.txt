@@ -1,0 +1,5 @@
+# The mtwan MUSA image provides these packages through --system-site-packages.
+# Keep uv/pip from replacing them with PyPI CUDA or CPU wheels in .venv.
+torch==2.7.1
+torchvision==0.22.1
+huggingface-hub==0.34.4
